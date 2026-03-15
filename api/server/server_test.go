@@ -3,105 +3,78 @@ package server_test
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/adm87/smol-server/api/server"
 )
 
-func TestWithContextNil(t *testing.T) {
-	s := server.WithContext(nil)
-	if s == nil {
-		t.Fatal("expected server instance")
-	}
-}
-
-func TestStartPreCanceledContextReturnsError(t *testing.T) {
+func TestRunReturnsContextCanceledForPreCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	s := server.WithContext(ctx)
-	err := s.Start()
+	s := server.New(server.WithAddress("127.0.0.1:0"))
+	err := s.Run(ctx)
+
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got: %v", err)
 	}
 }
 
-func TestStartReturnsErrorWhenAlreadyStarted(t *testing.T) {
+func TestRunShutsDownOnContextCancel(t *testing.T) {
+	addr := reserveLocalAddress(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	addr := reserveLocalAddress(t)
-	s := server.WithContext(ctx).SetAddress(addr)
-
+	s := server.New(server.WithAddress(addr))
 	done := make(chan error, 1)
 	go func() {
-		done <- s.Start()
+		done <- s.Run(ctx)
 	}()
 
 	waitForHTTPReady(t, addr)
-
-	err := s.Start()
-	if err == nil || err.Error() != "server already started" {
-		t.Fatalf("expected already started error, got: %v", err)
-	}
-
 	cancel()
-	select {
-	case runErr := <-done:
-		if runErr != nil {
-			t.Fatalf("expected first Start() to exit cleanly, got: %v", runErr)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for running server to stop")
-	}
-}
-
-func TestStopIsIdempotent(t *testing.T) {
-	addr := reserveLocalAddress(t)
-	s := server.WithContext(context.Background()).SetAddress(addr)
-
-	done := make(chan error, 1)
-	go func() {
-		done <- s.Start()
-	}()
-
-	waitForHTTPReady(t, addr)
-
-	s.Stop()
-	s.Stop()
 
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("expected Start() to exit cleanly after Stop(), got: %v", err)
+			t.Fatalf("expected clean shutdown, got: %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for server stop")
+		t.Fatal("timed out waiting for server shutdown")
 	}
 }
 
-func TestSetHandlerNilUsesNotFoundHandler(t *testing.T) {
+func TestWithHandlerNilFallsBackToNotFound(t *testing.T) {
 	addr := reserveLocalAddress(t)
-	s := server.WithContext(context.Background()).SetAddress(addr).SetHandler(nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s := server.New(
+		server.WithAddress(addr),
+		server.WithHandler(nil),
+	)
 
 	done := make(chan error, 1)
 	go func() {
-		done <- s.Start()
+		done <- s.Run(ctx)
 	}()
-	t.Cleanup(func() {
-		s.Stop()
+	defer func() {
+		cancel()
 		select {
 		case <-done:
 		case <-time.After(2 * time.Second):
 		}
-	})
+	}()
 
 	waitForHTTPReady(t, addr)
 
-	resp, err := http.Get("http://" + addr + "/missing")
+	client := &http.Client{Timeout: 300 * time.Millisecond}
+	resp, err := client.Get("http://" + addr + "/missing")
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -112,77 +85,218 @@ func TestSetHandlerNilUsesNotFoundHandler(t *testing.T) {
 	}
 }
 
-func TestSetAddressIgnoredAfterStart(t *testing.T) {
-	addrA := reserveLocalAddress(t)
-	addrB := reserveLocalAddress(t)
-	s := server.WithContext(context.Background()).SetAddress(addrA)
-
-	done := make(chan error, 1)
-	go func() {
-		done <- s.Start()
-	}()
-
-	waitForHTTPReady(t, addrA)
-
-	s.SetAddress(addrB)
-
-	resp, err := http.Get("http://" + addrA + "/after-start")
-	if err != nil {
-		t.Fatalf("expected server to remain on original address: %v", err)
-	}
-	resp.Body.Close()
-
-	client := &http.Client{Timeout: 150 * time.Millisecond}
-	_, err = client.Get("http://" + addrB + "/after-start")
-	if err == nil {
-		t.Fatal("expected no server on new address after SetAddress post-start")
-	}
-
-	s.Stop()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("expected Start() to exit cleanly after Stop(), got: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for server stop")
-	}
-}
-
-func TestSetLoggerNilFallsBackToDefault(t *testing.T) {
-	addr := reserveLocalAddress(t)
-	s := server.WithContext(context.Background()).SetAddress(addr).SetLogger(nil)
-
-	done := make(chan error, 1)
-	go func() {
-		done <- s.Start()
-	}()
-
-	waitForHTTPReady(t, addr)
-
-	s.Stop()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("expected Start() to exit cleanly after Stop(), got: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for server stop")
-	}
-}
-
-func TestStartReturnsErrorOnBindFailure(t *testing.T) {
+func TestRunReturnsErrorOnBindFailure(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to reserve local port: %v", err)
 	}
 	defer listener.Close()
 
-	s := server.WithContext(context.Background()).SetAddress(listener.Addr().String())
-
-	err = s.Start()
+	s := server.New(server.WithAddress(listener.Addr().String()))
+	err = s.Run(context.Background())
 	if err == nil {
 		t.Fatal("expected startup error when binding to occupied port")
+	}
+}
+
+func TestAddressUpdatesAfterEphemeralBind(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s := server.New(server.WithAddress("127.0.0.1:0"))
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Run(ctx)
+	}()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+	}()
+
+	boundAddr := waitForBoundAddress(t, s)
+	if strings.HasSuffix(boundAddr, ":0") {
+		t.Fatalf("expected effective bound address, got: %q", boundAddr)
+	}
+
+	waitForHTTPReady(t, boundAddr)
+}
+
+func TestRunWithNilLoggerDoesNotPanic(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to reserve local port: %v", err)
+	}
+	defer listener.Close()
+
+	s := server.New(
+		server.WithAddress(listener.Addr().String()),
+		server.WithLogger(nil),
+	)
+
+	err = s.Run(nil)
+	if err == nil {
+		t.Fatal("expected startup error on occupied address")
+	}
+}
+
+func TestWithHandlerUsesCustomHandler(t *testing.T) {
+	addr := reserveLocalAddress(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/ready" {
+			http.NotFound(w, r)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	s := server.New(
+		server.WithAddress(addr),
+		server.WithHandler(handler),
+	)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Run(ctx)
+	}()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+	}()
+
+	waitForHTTPReady(t, addr)
+
+	client := &http.Client{Timeout: 300 * time.Millisecond}
+	resp, err := client.Get("http://" + addr + "/ready")
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("failed to read response body: %v", err)
+	}
+
+	if string(body) != "ok" {
+		t.Fatalf("expected body %q, got %q", "ok", string(body))
+	}
+}
+
+func TestRunReturnsErrorWhenAlreadyRunning(t *testing.T) {
+	addr := reserveLocalAddress(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s := server.New(server.WithAddress(addr))
+
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Run(ctx)
+	}()
+
+	waitForHTTPReady(t, addr)
+
+	err := s.Run(context.Background())
+	if !errors.Is(err, server.ErrServerAlreadyRunning) {
+		t.Fatalf("expected ErrServerAlreadyRunning, got: %v", err)
+	}
+
+	cancel()
+	select {
+	case runErr := <-done:
+		if runErr != nil {
+			t.Fatalf("expected clean shutdown, got: %v", runErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for server shutdown")
+	}
+}
+
+func TestRunReturnsDeadlineExceededWhenShutdownTimesOut(t *testing.T) {
+	addr := reserveLocalAddress(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	requestStarted := make(chan struct{}, 1)
+	releaseRequest := make(chan struct{})
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/healthz") {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+			return
+		}
+
+		select {
+		case requestStarted <- struct{}{}:
+		default:
+		}
+
+		<-releaseRequest
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("released"))
+	})
+
+	s := server.New(
+		server.WithAddress(addr),
+		server.WithHandler(handler),
+		server.WithShutdownTimeout(50*time.Millisecond),
+	)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Run(ctx)
+	}()
+
+	waitForHTTPReady(t, addr)
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	requestDone := make(chan struct{}, 1)
+	go func() {
+		resp, err := client.Get("http://" + addr + "/block")
+		if err == nil && resp != nil {
+			resp.Body.Close()
+		}
+		requestDone <- struct{}{}
+	}()
+
+	select {
+	case <-requestStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for blocking request to start")
+	}
+
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("expected context.DeadlineExceeded from shutdown timeout, got: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for server to stop after cancellation")
+	}
+
+	close(releaseRequest)
+	select {
+	case <-requestDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for blocked request goroutine to exit")
 	}
 }
 
@@ -219,4 +333,21 @@ func waitForHTTPReady(t *testing.T, addr string) {
 	}
 
 	t.Fatal("timed out waiting for server to become reachable")
+}
+
+func waitForBoundAddress(t *testing.T, s *server.Server) string {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		addr := s.Address()
+		if addr != "" && !strings.HasSuffix(addr, ":0") {
+			return addr
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatal("timed out waiting for effective bound address")
+	return ""
 }
