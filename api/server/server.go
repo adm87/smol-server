@@ -10,8 +10,12 @@ import (
 )
 
 const (
-	defaultAddress         = ":8080"
-	defaultShutdownTimeout = 5 * time.Second
+	defaultAddress           = ":8080"
+	defaultShutdownTimeout   = 5 * time.Second
+	defaultReadTimeout       = 5 * time.Second
+	defaultWriteTimeout      = 5 * time.Second
+	defaultIdleTimeout       = 120 * time.Second
+	defaultReadHeaderTimeout = 2 * time.Second
 )
 
 // Server is a small wrapper around net/http with context-driven lifecycle management.
@@ -45,8 +49,12 @@ func WithContext(ctx context.Context) *Server {
 		ctx:    c,
 		cancel: cancel,
 		server: &http.Server{
-			Addr:    defaultAddress,
-			Handler: http.NotFoundHandler(),
+			Addr:              defaultAddress,
+			Handler:           http.NotFoundHandler(),
+			ReadTimeout:       defaultReadTimeout,
+			WriteTimeout:      defaultWriteTimeout,
+			IdleTimeout:       defaultIdleTimeout,
+			ReadHeaderTimeout: defaultReadHeaderTimeout,
 		},
 		logger: slog.Default(),
 	}
@@ -223,13 +231,13 @@ func (s *Server) shutdownServer() error {
 
 	errs := make([]error, 0, 2)
 
-	if err := s.server.Shutdown(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		s.logger.Error("Failed to shutdown server gracefully", "error", err)
-		errs = append(errs, err)
+	if shutdownErr := s.server.Shutdown(ctx); shutdownErr != nil && !errors.Is(shutdownErr, http.ErrServerClosed) {
+		s.logger.Error("Failed to shutdown server gracefully", "error", shutdownErr)
+		errs = append(errs, shutdownErr)
 
-		if err := s.server.Close(); err != nil {
-			s.logger.Error("Failed to forcefully close server", "error", err)
-			errs = append(errs, err)
+		if closeErr := s.server.Close(); closeErr != nil {
+			s.logger.Error("Failed to forcefully close server", "error", closeErr)
+			errs = append(errs, closeErr)
 		}
 	}
 

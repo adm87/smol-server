@@ -1,17 +1,18 @@
-package server
+package server_test
 
 import (
 	"context"
 	"errors"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/adm87/smol-server/api/server"
 )
 
 func TestWithContextNil(t *testing.T) {
-	s := WithContext(nil)
+	s := server.WithContext(nil)
 	if s == nil {
 		t.Fatal("expected server instance")
 	}
@@ -21,7 +22,7 @@ func TestStartPreCanceledContextReturnsError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	s := WithContext(ctx)
+	s := server.WithContext(ctx)
 	err := s.Start()
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got: %v", err)
@@ -32,14 +33,15 @@ func TestStartReturnsErrorWhenAlreadyStarted(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	s := WithContext(ctx).SetAddress(":0")
+	addr := reserveLocalAddress(t)
+	s := server.WithContext(ctx).SetAddress(addr)
 
 	done := make(chan error, 1)
 	go func() {
 		done <- s.Start()
 	}()
 
-	waitForStarted(t, s)
+	waitForHTTPReady(t, addr)
 
 	err := s.Start()
 	if err == nil || err.Error() != "server already started" {
@@ -58,14 +60,15 @@ func TestStartReturnsErrorWhenAlreadyStarted(t *testing.T) {
 }
 
 func TestStopIsIdempotent(t *testing.T) {
-	s := WithContext(context.Background()).SetAddress(":0")
+	addr := reserveLocalAddress(t)
+	s := server.WithContext(context.Background()).SetAddress(addr)
 
 	done := make(chan error, 1)
 	go func() {
 		done <- s.Start()
 	}()
 
-	waitForStarted(t, s)
+	waitForHTTPReady(t, addr)
 
 	s.Stop()
 	s.Stop()
@@ -81,43 +84,90 @@ func TestStopIsIdempotent(t *testing.T) {
 }
 
 func TestSetHandlerNilUsesNotFoundHandler(t *testing.T) {
-	s := WithContext(context.Background()).SetHandler(nil)
+	addr := reserveLocalAddress(t)
+	s := server.WithContext(context.Background()).SetAddress(addr).SetHandler(nil)
 
-	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/missing", nil)
-	s.server.Handler.ServeHTTP(rr, req)
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Start()
+	}()
+	t.Cleanup(func() {
+		s.Stop()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+	})
 
-	if rr.Code != http.StatusNotFound {
-		t.Fatalf("expected 404, got: %d", rr.Code)
+	waitForHTTPReady(t, addr)
+
+	resp, err := http.Get("http://" + addr + "/missing")
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404, got: %d", resp.StatusCode)
 	}
 }
 
 func TestSetAddressIgnoredAfterStart(t *testing.T) {
-	s := WithContext(context.Background()).SetAddress(":0")
+	addrA := reserveLocalAddress(t)
+	addrB := reserveLocalAddress(t)
+	s := server.WithContext(context.Background()).SetAddress(addrA)
 
 	done := make(chan error, 1)
 	go func() {
 		done <- s.Start()
 	}()
 
-	waitForStarted(t, s)
+	waitForHTTPReady(t, addrA)
 
-	before := s.server.Addr
-	s.SetAddress("127.0.0.1:9999")
-	after := s.server.Addr
+	s.SetAddress(addrB)
 
-	if before != after {
-		t.Fatalf("expected address unchanged after start, before=%q after=%q", before, after)
+	resp, err := http.Get("http://" + addrA + "/after-start")
+	if err != nil {
+		t.Fatalf("expected server to remain on original address: %v", err)
+	}
+	resp.Body.Close()
+
+	client := &http.Client{Timeout: 150 * time.Millisecond}
+	_, err = client.Get("http://" + addrB + "/after-start")
+	if err == nil {
+		t.Fatal("expected no server on new address after SetAddress post-start")
 	}
 
 	s.Stop()
-	<-done
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("expected Start() to exit cleanly after Stop(), got: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for server stop")
+	}
 }
 
 func TestSetLoggerNilFallsBackToDefault(t *testing.T) {
-	s := WithContext(context.Background()).SetLogger(nil)
-	if s.logger == nil {
-		t.Fatal("expected non-nil logger")
+	addr := reserveLocalAddress(t)
+	s := server.WithContext(context.Background()).SetAddress(addr).SetLogger(nil)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Start()
+	}()
+
+	waitForHTTPReady(t, addr)
+
+	s.Stop()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("expected Start() to exit cleanly after Stop(), got: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for server stop")
 	}
 }
 
@@ -128,7 +178,7 @@ func TestStartReturnsErrorOnBindFailure(t *testing.T) {
 	}
 	defer listener.Close()
 
-	s := WithContext(context.Background()).SetAddress(listener.Addr().String())
+	s := server.WithContext(context.Background()).SetAddress(listener.Addr().String())
 
 	err = s.Start()
 	if err == nil {
@@ -136,20 +186,37 @@ func TestStartReturnsErrorOnBindFailure(t *testing.T) {
 	}
 }
 
-func waitForStarted(t *testing.T, s *Server) {
+func reserveLocalAddress(t *testing.T) string {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to reserve local address: %v", err)
+	}
+	addr := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatalf("failed to release reserved address: %v", err)
+	}
+
+	return addr
+}
+
+func waitForHTTPReady(t *testing.T, addr string) {
 	t.Helper()
 
 	deadline := time.Now().Add(2 * time.Second)
+	url := "http://" + addr + "/healthz"
+	client := &http.Client{Timeout: 100 * time.Millisecond}
+
 	for time.Now().Before(deadline) {
-		s.mu.Lock()
-		started := s.started
-		s.mu.Unlock()
-		if started {
+		resp, err := client.Get(url)
+		if err == nil {
+			resp.Body.Close()
 			return
 		}
 
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	t.Fatal("timed out waiting for server to enter started state")
+	t.Fatal("timed out waiting for server to become reachable")
 }
