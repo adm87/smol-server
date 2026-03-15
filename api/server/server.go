@@ -65,6 +65,11 @@ func (s *Server) Context() context.Context {
 	return s.ctx
 }
 
+// Logger returns the server's logger.
+func (s *Server) Logger() *slog.Logger {
+	return s.logger
+}
+
 // SetHandler sets the HTTP handler for the server. If not set, a default handler that returns 404 for all requests will be used.
 func (s *Server) SetHandler(handler http.Handler) *Server {
 	s.mu.Lock()
