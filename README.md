@@ -4,9 +4,9 @@ A small HTTP server wrapper with context-based shutdown.
 
 ## Features
 
-- Sensible defaults (`:8080`, 404 default handler)
-- Fluent configuration (`SetAddress`, timeout setters, `SetHandler`)
-- Graceful shutdown on context cancellation or `Stop()`
+- Sensible defaults (`:0` for dynamic port binding, 404 default handler)
+- Functional options (`WithAddress`, timeout options, `WithHandler`, `WithLogger`)
+- Graceful shutdown on context cancellation
 
 ## net/http Example
 
@@ -21,7 +21,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"smol-server/api/server"
+	"github.com/adm87/smol-server/api/server"
 )
 
 func main() {
@@ -34,11 +34,12 @@ func main() {
 		_, _ = w.Write([]byte("OK"))
 	})
 
-	s := server.WithContext(ctx).
-		SetHandler(mux).
-		SetAddress(":8080")
+	s := server.New(
+		server.WithAddress(":8080"),
+		server.WithHandler(mux),
+	)
 
-	if err := s.Start(); err != nil {
+	if err := s.Run(ctx); err != nil {
 		slog.Error("server stopped", "error", err)
 	}
 }
@@ -58,7 +59,7 @@ import (
 	"syscall"
 
 	"github.com/go-chi/chi/v5"
-	"smol-server/api/server"
+	"github.com/adm87/smol-server/api/server"
 )
 
 func main() {
@@ -71,11 +72,12 @@ func main() {
 		_, _ = w.Write([]byte("OK"))
 	})
 
-	s := server.WithContext(ctx).
-		SetHandler(r).
-		SetAddress(":8080")
+	s := server.New(
+		server.WithAddress(":8080"),
+		server.WithHandler(r),
+	)
 
-	if err := s.Start(); err != nil {
+	if err := s.Run(ctx); err != nil {
 		slog.Error("server stopped", "error", err)
 	}
 }
@@ -83,6 +85,6 @@ func main() {
 
 ## Notes
 
-- Configure the server before `Start()`.
-- `Start()` is single-use per server instance.
-- Cancel the parent context (or call `Stop()`) to trigger shutdown.
+- Configure the server before calling `Run(ctx)`.
+- `Run(ctx)` is single-use per server instance.
+- Cancel the run context to trigger graceful shutdown.
